@@ -87,16 +87,13 @@ colnames(gt_numeric_allsamples_num) <- colnames(gt_matrix_17)
 ```
 
 #2. Sliding Windows Creation (Rewriting vcf_windower with vcfR)
-
 Creating sliding windows for the genotype matrix and saving each window as a list of matrices, while also making sure that we have chrom, star, end data for each window. 
-
 The original vcf_windower function creates sliding windows of SNPs by position for each chromosome.
 Basic Concept:
 For each chromosome:
 Take the POS (position) vector.
 Make overlapping or non-overlapping windows of SNPs based on a fixed window size or base-pair distance.
 Store them as a list of data.frames with chrom, start, end.
-
 ##A. Custom function to create slidign windows for a given genotype matrix
 
 ```{r}

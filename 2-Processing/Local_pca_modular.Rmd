@@ -1,0 +1,665 @@
+---
+title: "Local_pca_modular"
+author: "Athmaja Viswanath"
+date: "2025-08-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#full locla pca with mds information for 1 vcf file at a time
+##function 1
+```{r}
+local_pca_fn = function(vcf_file , window_size = 1000, step_size = 500, npc=2){
+  #reading vcf file
+  vcf = read.vcfR(vcf_file, verbose = FALSE)
+  
+  # Get sample names
+  sample_names <- colnames(vcf@gt)[-1]  # Remove the "FORMAT" column
+  print(sample_names)
+  
+  # Extract chromosome and position
+  chroms <- getCHROM(vcf)
+  positions <- getPOS(vcf)
+    # Create a named list like `vcf_positions()`, name - chromosome, within whcih is the position , this output a list
+  vcf_pos_list <- split(positions, chroms)
+  
+  #Extracting genotype matrix
+  gt_matrix <- extract.gt(vcf, element = "GT", as.numeric = FALSE)
+  print(head(gt_matrix))
+  
+  gt_recode <- apply(gt_matrix, 2, function(x) {
+    x <- gsub("0\\|0|0/0", "0", x) 
+    x <- gsub("0\\|1|1\\|0|0/1|1/0", "1", x)
+    x <- gsub("1\\|1|1/1", "2", x)
+    x[x %in% c(".", "./.", ".|.")] <- NA
+    return(as.numeric(x))
+  }) 
+  
+  #,making sure the extracted matrix is numeric
+  gt_recode <- matrix(
+    as.numeric(gt_recode),
+    nrow = nrow(gt_matrix),
+    ncol = ncol(gt_matrix))
+  
+  #Adding the correct column names
+  colnames(gt_recode) <- colnames(gt_matrix)
+  print(head(gt_recode))
+  
+  #using vcf_windows functionthe function
+  regions <- make_vcf_windows(vcf, window_size = 1000, step_size = 500)
+  print(head(regions))
+  
+  #use custom window function
+  variant_chroms <- getCHROM(vcf)
+  variant_positions <- getPOS(vcf)
+  winfun <- make_custom_winfun(gt_recode, regions, variant_chroms, variant_positions)
+  
+  #eigen windows
+  eigen = eigen_windows(data = winfun, k = 2, win = NULL )   #uses eigen_windows() function from lostruct
+  print(dim(eigen))
+  print(print(head(eigen)))
+  print(str(eigen))
+  #pc distance
+  windist_allsamples <- pc_dist(eigen, npc=2)  #uses pc_dist() function from lostruct
+  print(head(windist_allsamples))
+  
+  #mds
+  fit2d_allsamples <- cmdscale( windist_allsamples, eig=TRUE, k=2 )  
+  #Identifying and labeling corners
+  xy_coords <- fit2d_allsamples$points
+  
+  # Ensure the number of rows match
+  stopifnot(nrow(xy_coords) == nrow(regions))
+  
+  # Combine genomic and MDS coordinates
+  mds_df <- cbind(regions, 
+                  MDS1 = xy_coords[,1],
+                  MDS2 = xy_coords[,2])
+  mds_df$midpoint = (mds_df$start + mds_df$end)/2
+  # Return results as a list
+  return(list(
+    sample_names = sample_names,
+    mds_df = mds_df,
+    eigen = eigen,
+    windist_allsamples = windist_allsamples,
+    fit2d_allsamples = fit2d_allsamples,
+    gt_recode = gt_recode,
+    regions = regions,
+    variant_chroms = variant_chroms,
+    variant_positions = variant_positions
+  ))
+}
+
+```
+
+##function 2
+```{r}
+#plotting key exploratory plots usign plot_pca function
+plot_lpca_results <- function(mds_df, chrom_name = "Chromosome") {
+  # Ensure required columns exist
+  required_cols <- c("MDS1", "MDS2", "midpoint")
+  if (!all(required_cols %in% colnames(mds_df))) {
+    stop("mds_df must contain columns: MDS1, MDS2, and midpoint")
+  }
+  
+  # MDS1 vs MDS2
+  mds1xmds2 <- ggplot(mds_df, aes(x = MDS2, y = MDS1)) +
+    geom_point() +
+    labs(title = paste("MDS1 vs MDS2 -", chrom_name),
+         x = "MDS2",
+         y = "MDS1") +
+    theme_bw()
+  
+  # MDS1 vs Genomic Position
+  mds1xbp <- ggplot(mds_df, aes(x = midpoint, y = MDS1)) +
+    geom_point() +
+    labs(title = paste("MDS1 vs Genomic Position -", chrom_name),
+         x = "Genomic Midpoint",
+         y = "MDS1") +
+    theme_bw()
+  
+  # MDS2 vs Genomic Position
+  mds2xbp <- ggplot(mds_df, aes(x = midpoint, y = MDS2)) +
+    geom_point() +
+    labs(title = paste("MDS2 vs Genomic Position -", chrom_name),
+         x = "Genomic Midpoint",
+         y = "MDS2") +
+    theme_bw()
+  
+  # Interactive version of MDS1 vs Genomic Position
+  interactive_mds1xbp <- ggplotly(mds1xbp)
+  
+  return(list(
+    mds1_vs_mds2 = mds1xmds2,
+    mds1_vs_bp   = mds1xbp,
+    mds2_vs_bp   = mds2xbp,
+    mds1_vs_bp_interactive = interactive_mds1xbp
+  ))
+}
+
+```
+
+##function 3
+```{r}
+#after choosing the windows, run fucntion to get genotype matrix for tos ewindows adn perform aggregate pca
+
+aggregate_pca = function(left_boundary, right_boundary, mds_df, variant_chroms, variant_positions, gt_recode){
+  #Extracting windows within extreme midpoints
+  cluster_idx <- which(mds_df$midpoint >= left_boundary & mds_df$midpoint <= right_boundary)
+  cluster_windows <- mds_df[cluster_idx, ]
+  print(dim(cluster_windows))
+  
+  #Extracting genotype matrix for these windows
+  keep_rows <- unlist(mapply(function(ch, start, end) {
+    which(variant_chroms == ch & variant_positions >= start & variant_positions <= end)
+  }, cluster_windows$chrom, cluster_windows$start, cluster_windows$end, SIMPLIFY = FALSE))
+  
+  #Final genotype matrix that has all genotype information for only the region we are interested in
+  cluster_genotypes <- gt_recode[keep_rows, , drop = FALSE]
+  
+  # Remember your matrix is SNPs x samples, so variance per row
+  var_per_snp <- apply(cluster_genotypes, 1, var, na.rm = TRUE)
+  
+  # Keep only SNPs with variance > 0
+  cluster_genotypes_var <- cluster_genotypes[var_per_snp > 0, , drop = FALSE]
+  cluster_genotypes_var = na.omit(cluster_genotypes_var)
+  
+  # Run PCA on filtered matrix (transpose to samples x SNPs)
+  pca_res <- prcomp(t(cluster_genotypes_var), center = TRUE, scale. = TRUE)
+  
+  # Extract PCA scores (coordinates of samples)
+  pca_scores <- data.frame(pca_res$x)
+  
+  # Add sample names as a column
+  pca_scores$sample <- colnames(cluster_genotypes_var)
+  
+  # Add a new column called 'region' based on the Sample name
+  pca_scores$region <- dplyr::case_when(
+    grepl("^IRA_", pca_scores$sample) ~ "Iran",
+    grepl("^FRA_", pca_scores$sample) ~ "France",
+    grepl("^GER_", pca_scores$sample) ~ "Germany",
+    grepl("^MWN01[A-H]", pca_scores$sample) ~ "Northeast Spain",
+    grepl("^MWN01[I-P]", pca_scores$sample) ~ "Italy",
+    grepl("^MWN01Q|^MWN01R|^MWN03-I_|^MWN03-M_|^MWN03-P_", pca_scores$sample) ~ "England",
+    grepl("^MWN01S|^MWN01T|^MWN01U|^MWN01V|^MWN01W|^MWN01X|^MWN03-G_|^MWN03-H_|^MWN03-J_|^MWN03-N_|^MWN03-Q_", pca_scores$sample) ~ "Scotland",
+    grepl("^MWN02[A-J]", pca_scores$sample) ~ "Portugal",
+    grepl("^MWN02[K-T]", pca_scores$sample) ~ "Southwest Spain",
+    grepl("^MWN03-[A-E]", pca_scores$sample) ~ "North France",
+    grepl("^MWN03-F_", pca_scores$sample) ~ "Guernsey",
+    grepl("^MWN03-K_", pca_scores$sample) ~ "Wales",
+    TRUE ~ "Unknown"
+  )
+  
+  # PCA results
+  print(head(pca_scores, 10))
+  return(list(
+    chr17_pca_scores = pca_scores
+  ))
+}
+
+
+```
+
+##Function 4
+```{r}
+#Basic PCA plot
+pca_plots = function(pca_scores) {
+  pc1xpca2 = ggplot(pca_scores, aes(x = PC1, y = PC2)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "PCA: PC1 vs PC2",
+       x = "PC1",
+       y = "PC2") +
+  theme(legend.position = "right")
+
+
+# Plot PC1 vs PC2 colored by sample
+pc1xpc2_bysample = ggplot(pca_scores, aes(x = PC1, y = PC2, color = sample)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "PCA: PC1 vs PC2",
+       x = "PC1",
+       y = "PC2") +
+  theme(legend.position = "right")
+
+# Coloured by region
+pc1xpc2_byregion = ggplot(pca_scores, aes(x = PC1, y = PC2, fill = region)) +
+  geom_point(size = 3, shape = 21, colour = "black") +
+  theme_minimal() +
+  labs(title = "PCA: PC1 vs PC2",
+       x = "PC1",
+       y = "PC2") +
+  geom_text(aes(label = region), vjust = -0.5, hjust = 0.5)+
+  theme(legend.position = "right")+
+  scale_color_brewer(palette = "Set3") 
+
+return(list(
+  pc1xpca2   = pc1xpca2,
+  pc1xpc2_bysample   = pc1xpc2_bysample,
+  pc1xpc2_byregion = pc1xpc2_byregion
+))
+}
+
+```
+
+##Final function
+```{r}
+# Function to run only Step 1 + Step 2
+run_lpca_step1_2 <- function(chrom_num, vcf_dir, window_size = 1000, step_size = 500, npc = 2) {
+  
+  chrom_name <- paste0("Chromosome ", chrom_num)
+  vcf_file <- file.path(vcf_dir, paste0("chr", chrom_num, ".vcf"))
+  
+  cat("Processing", chrom_name, "from", vcf_file, "\n")
+  
+  # Step 1: local PCA
+  lpca_res <- local_pca_fn(vcf_file = vcf_file,
+                           window_size = window_size,
+                           step_size = step_size,
+                           npc = npc)
+  
+  # Step 2: plotting LPCA results
+  lpca_plots <- plot_lpca_results(mds_df = lpca_res$mds_df, chrom_name = chrom_name)
+  
+  return(list(
+    lpca_res = lpca_res,
+    lpca_plots = lpca_plots
+  ))
+}
+
+# ---- Run for all chromosomes ----
+vcf_dir <- "1-Input"
+step2_results <- list()
+
+for (chrom in 1:19) {
+  step2_results[[paste0("chr", chrom)]] <- run_lpca_step1_2(
+    chrom_num = chrom,
+    vcf_dir = vcf_dir
+  )
+}
+
+# ---- How to view Step 2 results ----
+# Example: MDS plot for chromosome 5
+step2_results$chr5$lpca_plots$mds1_vs_mds2
+
+# Example: inspect mds_df for chromosome 5
+head(step2_results$chr5$lpca_res$mds_df)
+
+step2_results$chr17$lpca_plots$mds1_vs_bp
+```
+
+
+##STEP1
+```{r}
+#laoding vcf and running local pca
+lpca_chr17 = local_pca_fn(vcf_file = "1-Input/chr17.vcf", window_size = 1000, step_size = 500, npc = 2)
+```
+
+##STEP2
+```{r}
+#using the function
+chr17_results = plot_lpca_results(mds_df = lpca_chr17$mds_df, chrom_name = "17")
+
+#access plots
+chr17_results$mds1_vs_mds2
+chr17_results$mds1_vs_bp
+chr17_results$mds2_vs_bp
+chr17_results$mds1_vs_bp_interactive
+```
+
+##STEP3
+```{r}
+#running aggregate pca
+ch17_thaplo = aggregate_pca(left_boundary = 6028409, right_boundary = 40657059, mds_df = lpca_chr17$mds_df, 
+                            variant_chroms = lpca_chr17$variant_chroms, variant_positions =lpca_chr17$variant_positions, 
+                            gt_recode = lpca_chr17$gt_recode)
+```
+
+##STEP4
+```{r}
+#running command
+pca_ch17_results = pca_plots(pca_scores = ch17_thaplo$chr17_pca_scores)
+
+#access plots
+pca_ch17_results$pc1xpca2
+pca_ch17_results$pc1xpc2_bysample
+pca_ch17_results$pc1xpc2_byregion
+```
+
+
+
+#STEP 1& 2 FOR ALL CHROMOSOMES
+```{r}
+# Function to run only Step 1 + Step 2
+run_lpca_step1_2 <- function(chrom_num, vcf_dir, window_size = 1000, step_size = 500, npc = 2) {
+  
+  chrom_name <- paste0("Chromosome ", chrom_num)
+  vcf_file <- file.path(vcf_dir, paste0("chr", chrom_num, ".vcf"))
+  
+  cat("Processing", chrom_name, "from", vcf_file, "\n")
+  
+  # Step 1: local PCA
+  lpca_res <- local_pca_fn(vcf_file = vcf_file,
+                           window_size = window_size,
+                           step_size = step_size,
+                           npc = npc)
+  
+  # Step 2: plotting LPCA results
+  lpca_plots <- plot_lpca_results(mds_df = lpca_res$mds_df, chrom_name = chrom_name)
+  
+  return(list(
+    lpca_res = lpca_res,
+    lpca_plots = lpca_plots
+  ))
+}
+
+# ---- Run for all chromosomes ----
+vcf_dir <- "1-Input"
+step2_results <- list()
+
+for (chrom in 1:19) {
+  step2_results[[paste0("chr", chrom)]] <- run_lpca_step1_2(
+    chrom_num = chrom,
+    vcf_dir = vcf_dir
+  )
+}
+
+# ---- How to view Step 2 results ----
+# Example: MDS plot for chromosome 5
+step2_results$chr5$lpca_plots$mds1_vs_mds2
+
+# Example: inspect mds_df for chromosome 5
+head(step2_results$chr5$lpca_res$mds_df)
+
+step2_results$chr17$lpca_plots$mds1_vs_bp
+```
+
+#COMBINED PLOTS MDS1 VS GENOMIC LOCATION
+```{r}
+library(patchwork)
+library(ggplot2)
+library(gridExtra)
+
+# Assume step2_results contains lpca_plots for chr1 to chr19
+chromosomes <- paste0("chr", 1:19)
+
+plots <- lapply(chromosomes, function(chr) {
+  step2_results[[chr]]$lpca_plots$mds1_vs_bp + 
+    ggtitle(chr) + 
+    theme(plot.title = element_text(hjust = 0.5))
+})
+
+# Combine all plots into a grid (e.g., 5 columns x 4 rows)
+combined_plot <- wrap_plots(plots, ncol = 5)
+
+# Display combined plot
+print(combined_plot)
+
+ggsave(filename = "../3-Output/combined_mds1_vs_bp_plots.pdf", 
+       plot = combined_plot, 
+       device = "pdf", 
+       width = 30, 
+       height = 20)
+
+```
+
+
+
+#Chromosome 1
+```{r}
+#Step 1 & 2
+head(step2_results$chr1$lpca_res$mds_df)
+
+#visualizing MDS plots
+step2_results$chr1$lpca_plots$mds1_vs_mds2
+# Combine all plots into a grid (e.g., 5 columns x 4 rows)
+combined_plot <- wrap_plots(plots, ncol = 5)
+
+# Display combined plot
+print(combined_plot)
+
+ggsave(filename = "../3-Output/combined_mds1_vs_bp_plots.pdf", 
+       plot = combined_plot, 
+       device = "pdf", 
+       width = 30, 
+       height = 20)
+
+#Step 3
+#running aggregate pca
+ch1_agpca = aggregate_pca(left_boundary = 14585396, right_boundary = 89717677, 
+                          mds_df = step2_results$chr1$lpca_res$mds_df, 
+                            variant_chroms = step2_results$chr1$lpca_res$variant_chroms, 
+                            variant_positions = step2_results$chr1$lpca_res$variant_positions,
+                          gt_recode = step2_results$chr1$lpca_res$gt_recode)
+
+#Step 4
+#running command
+pca_ch1_results = pca_plots(pca_scores = ch1_agpca$chr17_pca_scores)
+
+#access plots
+pca_ch1_results$pc1xpca2
+pca_ch1_results$pc1xpc2_bysample
+pca_ch1_results$pc1xpc2_byregion
+
+```
+
+
+#Chromosome 2
+```{r}
+#Step 1
+#laoding vcf and running local pca
+lpca_chr2 = local_pca_fn(vcf_file = "../1-Input/chr2.vcf", window_size = 1000, step_size = 500, npc = 2)
+
+#Step 2
+#using the function
+chr2_results = plot_lpca_results(mds_df = lpca_chr2$mds_df, chrom_name = "Chromosome 2")
+
+#access plots
+chr2_results$mds1_vs_mds2
+chr2_results$mds1_vs_bp
+chr2_results$mds2_vs_bp
+chr2_results$mds1_vs_bp_interactive
+
+#Step 3
+#running aggregate pca
+ch2_agpca = aggregate_pca(left_boundary = 14585396, right_boundary = 89717677, mds_df = lpca_chr2$mds_df, 
+                            variant_chroms = lpca_chr2$variant_chroms, 
+                            variant_positions = lpca_chr2$variant_positions, gt_recode = lpca_chr2$gt_recode)
+
+#Step 4
+#running command
+pca_ch2_results = pca_plots(pca_scores = ch2_agpca$chr17_pca_scores)
+
+#access plots
+pca_ch2_results$pc1xpca2
+pca_ch2_results$pc1xpc2_bysample
+pca_ch2_results$pc1xpc2_byregion
+
+```
+
+
+#Chromosome17
+```{r}
+#Step 1 & 2
+head(step2_results$chr17$lpca_res$mds_df)
+
+#visualizing MDS plots
+mds1_vs_mds2_17 = step2_results$chr17$lpca_plots$mds1_vs_mds2
+mds1_vs_bp_17 = step2_results$chr17$lpca_plots$mds1_vs_bp
+mds2_vs_bp_17 = step2_results$chr17$lpca_plots$mds2_vs_bp
+mds1_vs_bp_17int = step2_results$chr17$lpca_plots$mds1_vs_bp_interactive
+
+# Combine all plots into a grid (e.g., 5 columns x 4 rows)
+mds_plots_17 <- wrap_plots(mds1_vs_mds2_17, mds1_vs_bp_17, mds2_vs_bp_17,  ncol = 3)
+
+# Display combined plot
+print(mds_plots_17)
+
+ggsave(filename = "../3-Output/mds_plots_17.pdf", 
+       plot = mds_plots_17, 
+       device = "pdf", 
+       width = 30, 
+       height = 10)
+
+#Step 3
+#running aggregate pca
+ch17_agpca = aggregate_pca(left_boundary = 6028409, right_boundary = 40657059, 
+                          mds_df = step2_results$chr17$lpca_res$mds_df, 
+                            variant_chroms = step2_results$chr17$lpca_res$variant_chroms, 
+                            variant_positions = step2_results$chr17$lpca_res$variant_positions,
+                          gt_recode = step2_results$chr17$lpca_res$gt_recode)
+
+#Step 4
+#running command
+pca_ch17_results = pca_plots(pca_scores = ch17_agpca$chr17_pca_scores)
+
+#access plots
+pca_ch17_results$pc1xpca2
+pca_ch17_results$pc1xpc2_bysample
+pca_ch17_results$pc1xpc2_byregion
+```
+
+##Visualizing clusters
+```{r}
+#Creating clusters
+km_2 <- kmeans(ch17_agpca$chr17_pca_scores[, c("PC1", "PC2")], centers = 2)  # or 3
+ch17_agpca$chr17_pca_scores$cluster <- factor(km_2$cluster)
+#pca_scores_cl2 = pca_scores 
+
+#Plotting 2 clusters on PCA plot
+ggplot(ch17_agpca$chr17_pca_scores, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  geom_text(aes(label = region), vjust = -0.5, hjust = 0.5)+
+  labs(title = "PCA with Cluster Assignments",
+       x = "PC1", y = "PC2", color = "Cluster")
+
+#labeling the centroids
+
+centroids <- ch17_agpca$chr17_pca_scores %>%
+  group_by(cluster) %>%
+  summarize(PC1 = mean(PC1), PC2 = mean(PC2))
+
+#Plotting 2 clusters on PCA plot
+ggplot(ch17_agpca$chr17_pca_scores, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(size = 3) +
+  geom_text(data = centroids, aes(label = cluster), size = 5, color = "black") +
+  theme_minimal() +
+  labs(title = "PCA with Cluster Labels")
+
+```
+#8.Visualizing the differences between clusters
+##A. Subsetting genotype matrix for each cluster
+```{r}
+#subsetting genotype matrix by cluster
+# Confirm sample alignment
+#all(ch17_agpca$chr17_pca_scores$sample %in% colnames(cluster_genotypes_var))  # should be TRUE
+
+
+cluster_ids_2 <- unique(ch17_agpca$chr17_pca_scores$cluster)
+
+
+# Create a list of genotype subsets per cluster
+#for 2 clusters
+cluster_genotypes_2 <- lapply(cluster_ids_2, function(cl) {
+  samples_in_cluster <- pca_scores_cl2$sample[pca_scores_cl2$cluster == cl]
+  cluster_genotypes_var[, samples_in_cluster, drop = FALSE]
+})
+names(cluster_genotypes_2) <- paste0("Cluster_", cluster_ids_2)
+
+#head(cluster_genotypes_2)
+
+#for 3 clusters
+cluster_genotypes_3 <- lapply(cluster_ids_3, function(cl) {
+  samples_in_cluster <- pca_scores_c3$sample[pca_scores_c3$cluster == cl]
+  cluster_genotypes_var[, samples_in_cluster, drop = FALSE]
+})
+names(cluster_genotypes_3) <- paste0("Cluster_", cluster_ids_3)
+
+#head(cluster_genotypes_3)
+
+```
+
+##B. Calculating # of heterozygous sites in each cluster (heterozygosity) to knwo which samples are heterozygouse vs homozygous
+###I.Function to summarize genotypes
+```{r}
+#Function to summarize genotypes
+summarize_genotypes <- function(cluster_genotypes) {
+  t(apply(cluster_genotypes, 2, function(x) {
+    c(
+      homo_ref = sum(x == 0, na.rm = TRUE),
+      het = sum(x == 1, na.rm = TRUE),
+      homo_alt = sum(x == 2, na.rm = TRUE)
+    )
+  }))
+}
+
+# Apply to each cluster
+sample_summaries_c2 <- lapply(cluster_genotypes_2, summarize_genotypes)
+sample_summaries_c3 <- lapply(cluster_genotypes_3, summarize_genotypes)
+
+```
+
+###II. Adding cluster info and combine
+```{r}
+#2 clusters
+summary_df_2 <- do.call(rbind, lapply(names(sample_summaries_c2), function(cl) {
+  df <- as.data.frame(sample_summaries_c2[[cl]])
+  df$sample <- rownames(df)
+  df$cluster <- cl
+  df
+}))
+
+#3 clusters
+summary_df_3 <- do.call(rbind, lapply(names(sample_summaries_c3), function(cl) {
+  df <- as.data.frame(sample_summaries_c3[[cl]])
+  df$sample <- rownames(df)
+  df$cluster <- cl
+  df
+}))
+
+```
+
+###III. Visualizing heterozygosity between clusters
+```{r}
+#2 clusters
+ggplot(summary_df_2, aes(x = cluster, y = het)) +
+  geom_boxplot(fill = "skyblue") +
+  labs(title = "Heterozygosity across clusters", y = "# Heterozygous Sites") +
+  theme_minimal()
+
+#3 clusters
+ggplot(summary_df_3, aes(x = cluster, y = het)) +
+  geom_boxplot(fill = "skyblue") +
+  labs(title = "Heterozygosity across clusters", y = "# Heterozygous Sites") +
+  theme_minimal()
+```
+
+##C. Calculating percentge of heterozygous sites
+###I. 2 clusters
+```{r}
+#2 clusters
+summary_df_2 <- summary_df_2 %>%
+  mutate(
+    total = homo_ref + het + homo_alt,
+    perc_het = 100 * het / total,
+    perc_hom_ref = 100 * homo_ref / total,
+    perc_hom_alt = 100 * homo_alt / total
+  )
+
+#ggplot 
+ggplot(summary_df_2, aes(x = cluster, y = perc_het)) +
+  geom_boxplot(fill = "lightgreen") +
+  labs(
+    title = "% Heterozygosity across clusters",
+    y = "% Heterozygous sites",
+    x = "Cluster"
+  ) +
+  theme_minimal()
+
+
+```
+
